@@ -74,6 +74,11 @@ from .generation import (
     remove_instructions,
     update_instructions,
 )
+from .interruption_handler import (
+    InterruptionHandler,
+    InterruptionDecision,
+    get_interruption_handler,
+)
 from .speech_handle import SpeechHandle
 
 if TYPE_CHECKING:
@@ -141,6 +146,10 @@ class AgentActivity(RecognitionHooks):
 
         self._on_enter_task: asyncio.Task | None = None
         self._on_exit_task: asyncio.Task | None = None
+
+        # Context-aware interruption handler for distinguishing passive acknowledgements
+        # from active interruptions based on agent speaking state
+        self._interruption_handler: InterruptionHandler = get_interruption_handler()
 
         if (
             isinstance(self.llm, llm.RealtimeModel)
@@ -1166,7 +1175,30 @@ class AgentActivity(RecognitionHooks):
         )
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
-    def _interrupt_by_audio_activity(self) -> None:
+    def _is_agent_speaking(self) -> bool:
+        """
+        Check if the agent is currently speaking/playing audio.
+        Used by the interruption handler to determine context.
+        """
+        return (
+            self._current_speech is not None
+            and not self._current_speech.interrupted
+            and not self._current_speech.done()
+        )
+
+    def _interrupt_by_audio_activity(self, transcript: str | None = None) -> None:
+        """
+        Handle potential interruption from user audio activity.
+        
+        This method implements context-aware interruption handling:
+        - If agent is speaking and user says passive acknowledgement → IGNORE
+        - If agent is speaking and user says interrupt command → INTERRUPT
+        - If agent is silent → process normally
+        
+        Args:
+            transcript: Optional user transcript for intelligent filtering.
+                       If None, uses current transcript from audio recognition.
+        """
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
 
@@ -1174,6 +1206,32 @@ class AgentActivity(RecognitionHooks):
             # ignore if realtime model has turn detection enabled
             return
 
+        # Get transcript for context-aware filtering
+        if transcript is None and self._audio_recognition is not None:
+            transcript = self._audio_recognition.current_transcript
+        
+        agent_is_speaking = self._is_agent_speaking()
+        
+        # === CONTEXT-AWARE INTERRUPTION LOGIC ===
+        # Use the interruption handler to classify the input
+        if transcript and agent_is_speaking:
+            result = self._interruption_handler.classify(transcript, agent_is_speaking)
+            
+            if result.decision == InterruptionDecision.IGNORE:
+                # Passive acknowledgement while agent is speaking - IGNORE completely
+                # Do NOT pause, do NOT interrupt, continue seamlessly
+                logger.debug(
+                    f"Ignoring passive acknowledgement while speaking: "
+                    f"\"{transcript[:50]}\" - {result.reason}"
+                )
+                return
+            
+            # For INTERRUPT decision, fall through to existing logic
+            logger.debug(
+                f"Processing interruption: \"{transcript[:50]}\" - {result.reason}"
+            )
+
+        # Original min_interruption_words check (for backward compatibility)
         if (
             self.stt is not None
             and opt.min_interruption_words > 0
@@ -1240,46 +1298,56 @@ class AgentActivity(RecognitionHooks):
             # ignore vad inference done event if turn_detection is manual or realtime_llm
             return
 
-        if ev.speech_duration >= self._session.options.min_interruption_duration:
-            self._interrupt_by_audio_activity()
+        # IMPORTANT: Do NOT call _interrupt_by_audio_activity here.
+        # VAD alone must NOT trigger interruption decisions.
+        # All interruption decisions are deferred to on_final_transcript
+        # to ensure passive acknowledgements never cause audio disruption.
+        # The min_interruption_duration check is still useful for metrics,
+        # but actual interruption is gated by final transcript classification.
+        pass
 
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
             # skip stt transcription if user_transcription is enabled on the realtime model
             return
 
+        transcript_text = ev.alternatives[0].text
+
         self._session._user_input_transcribed(
             UserInputTranscribedEvent(
                 language=ev.alternatives[0].language,
-                transcript=ev.alternatives[0].text,
+                transcript=transcript_text,
                 is_final=False,
                 speaker_id=ev.alternatives[0].speaker_id,
             ),
         )
 
-        if ev.alternatives[0].text and self._turn_detection not in (
-            "manual",
-            "realtime_llm",
-        ):
-            self._interrupt_by_audio_activity()
+        # IMPORTANT: Do NOT call _interrupt_by_audio_activity here.
+        # Interim transcripts must NOT trigger interruption decisions.
+        # All interruption decisions are deferred to on_final_transcript
+        # to ensure passive acknowledgements never cause audio disruption.
+        # This guarantees the agent continues speaking seamlessly until
+        # we have definitive text to classify.
 
-            if (
-                speaking is False
-                and self._paused_speech
-                and (timeout := self._session.options.false_interruption_timeout) is not None
-            ):
-                # schedule a resume timer if interrupted after end_of_speech
-                self._start_false_interruption_timer(timeout)
+        if (
+            speaking is False
+            and self._paused_speech
+            and (timeout := self._session.options.false_interruption_timeout) is not None
+        ):
+            # schedule a resume timer if interrupted after end_of_speech
+            self._start_false_interruption_timer(timeout)
 
     def on_final_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None = None) -> None:
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
             # skip stt transcription if user_transcription is enabled on the realtime model
             return
 
+        transcript_text = ev.alternatives[0].text
+
         self._session._user_input_transcribed(
             UserInputTranscribedEvent(
                 language=ev.alternatives[0].language,
-                transcript=ev.alternatives[0].text,
+                transcript=transcript_text,
                 is_final=True,
                 speaker_id=ev.alternatives[0].speaker_id,
             ),
@@ -1292,7 +1360,8 @@ class AgentActivity(RecognitionHooks):
             "manual",
             "realtime_llm",
         ):
-            self._interrupt_by_audio_activity()
+            # Pass transcript for context-aware interruption handling
+            self._interrupt_by_audio_activity(transcript=transcript_text)
 
             if (
                 speaking is False

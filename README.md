@@ -360,6 +360,146 @@ Runs the agent with production-ready optimizations.
 
 The Agents framework is under active development in a rapidly evolving field. We welcome and appreciate contributions of any kind, be it feedback, bugfixes, features, new plugins and tools, or better documentation. You can file issues under this repo, open a PR, or chat with us in LiveKit's [Slack community](https://livekit.io/join-slack).
 
+---
+
+## Context-Aware Interruption Handling
+
+### Overview
+
+This fork implements intelligent interruption handling that distinguishes between **passive acknowledgements** (e.g., "yeah", "ok", "hmm") and **active interruptions** (e.g., "stop", "wait", "no") based on whether the agent is currently speaking.
+
+**Author**: Vignesh Balamurugan  
+**Branch**: `feature/interrupt-handler-vignesh-balamurugan-mb`
+
+### The Problem
+
+LiveKit's default Voice Activity Detection (VAD) is too sensitive to user feedback. When users say "yeah," "ok," "aha," or "hmm" (known as backchanneling) to indicate they are listening, the agent interprets this as an interruption and abruptly stops speaking.
+
+### The Solution
+
+A **context-aware logic layer** that:
+- **IGNORES** passive acknowledgements when the agent is speaking (no pause, no stutter)
+- **INTERRUPTS** immediately when the user says a command like "stop" or "wait"
+- **PROCESSES** all input normally when the agent is silent
+
+### Key Features
+
+#### 1. PRIMARY FEATURE: Context-Aware Interruption (Behavior-affecting)
+
+| User Input | Agent State | Behavior |
+|------------|-------------|----------|
+| "Yeah / Ok / Hmm" | Speaking | **IGNORE** - Agent continues seamlessly |
+| "Stop / Wait / No" | Speaking | **INTERRUPT** - Agent stops immediately |
+| "Yeah / Ok / Hmm" | Silent | **PROCESS** - Normal response |
+| "Yeah okay but wait" | Speaking | **INTERRUPT** - Contains command word |
+
+#### 2. ADDITIONAL FEATURE A: User Engagement Level (Observational Only)
+
+Tracks passive acknowledgements while agent speaks to determine listener engagement:
+- **LOW**: 0 acknowledgements in 8-second window
+- **MEDIUM**: 1-2 acknowledgements
+- **HIGH**: 3+ acknowledgements
+
+**⚠️ This feature does NOT affect agent behavior.** It only logs for analysis:
+```
+[ENGAGEMENT] passive_ack=3 window=8s level=HIGH
+```
+
+#### 3. ADDITIONAL FEATURE B: User Satisfaction Score (Observational Only)
+
+Tracks lexical satisfaction signals with a score between -1.0 and +1.0:
+- **Positive indicators**: yes, yeah, great, good, nice, perfect, awesome
+- **Negative indicators**: no, stop, wait, wrong, bad, problem, confusing
+
+**⚠️ This feature does NOT affect agent behavior.** It only logs for analysis:
+```
+[SATISFACTION] score=+0.4 signal=positive ("sounds good")
+```
+
+### Configuration
+
+Word lists are configurable via environment variables:
+
+```bash
+# Passive acknowledgements (comma-separated)
+export AGENT_PASSIVE_WORDS="yeah,yep,ok,okay,hmm,uh-huh,right,sure,cool"
+
+# Interrupt commands (comma-separated)
+export AGENT_INTERRUPT_WORDS="stop,wait,pause,no,cancel,hold on,listen"
+
+# Positive satisfaction indicators
+export AGENT_POSITIVE_WORDS="yes,yeah,great,good,nice,perfect,awesome"
+
+# Negative satisfaction indicators
+export AGENT_NEGATIVE_WORDS="no,stop,wait,wrong,bad,problem,confusing"
+```
+
+### Technical Implementation
+
+#### Files Modified/Added
+
+1. **`livekit-agents/livekit/agents/voice/interruption_handler.py`** (NEW)
+   - `InterruptionHandler` class with classification logic
+   - `EngagementState` for tracking passive acknowledgements
+   - `SatisfactionState` for tracking user satisfaction
+   - Configurable word sets loaded from environment variables
+
+2. **`livekit-agents/livekit/agents/voice/agent_activity.py`** (MODIFIED)
+   - Added `_interruption_handler` instance
+   - Added `_is_agent_speaking()` helper method
+   - Modified `_interrupt_by_audio_activity()` to use context-aware filtering
+   - Updated `on_interim_transcript()` and `on_final_transcript()` to pass transcript
+
+#### False-Start Handling Strategy
+
+Since VAD fires before STT text is available:
+1. VAD triggers potential interruption
+2. When transcript arrives, classify using `InterruptionHandler`
+3. If passive acknowledgement while speaking → **cancel interruption**
+4. If interrupt command or other content → **proceed with interruption**
+
+This is imperceptible in latency (<100ms typical STT delay).
+
+### Testing the Feature
+
+Run the example agent and test these scenarios:
+
+#### Scenario 1: Long Explanation
+- Agent is reading a long paragraph
+- User says "Okay... yeah... uh-huh"
+- **Expected**: Agent continues speaking without any break
+
+#### Scenario 2: Passive Affirmation
+- Agent asks "Are you ready?" and goes silent
+- User says "Yeah"
+- **Expected**: Agent processes "Yeah" as an answer
+
+#### Scenario 3: Correction
+- Agent is counting "One, two, three..."
+- User says "No stop"
+- **Expected**: Agent stops immediately
+
+#### Scenario 4: Mixed Input
+- Agent is speaking
+- User says "Yeah okay but wait"
+- **Expected**: Agent stops (because "wait" is an interrupt command)
+
+### Observing Logs
+
+To see engagement and satisfaction logs, enable debug logging:
+
+```python
+import logging
+logging.getLogger("livekit.agents.interruption_handler").setLevel(logging.DEBUG)
+```
+
+Or set environment variable:
+```bash
+export LOGLEVEL=DEBUG
+```
+
+---
+
 <!--BEGIN_REPO_NAV-->
 <br/><table>
 <thead><tr><th colspan="2">LiveKit Ecosystem</th></tr></thead>
